@@ -1,0 +1,38 @@
+# Recording profiles for go2_record.sh
+# The recorder runs `ros2 bag record -a` and excludes base_exclude + the profile's list.
+
+# Message types not built on this Jetson. Recording them breaks topic discovery for -a.
+base_exclude:
+  - /arm_Command
+  - /arm_Feedback
+  - /qt_.*
+  - /query_result_.*
+  - /pctoimage_local
+  - /config_change_status
+  - /utlidar/voxel_map_compressed
+
+profiles:
+  lite:       # no point clouds or video, ~0.4 MB/s
+    - /lowstate
+    - /lowcmd
+    - /utlidar/cloud
+    - /utlidar/cloud_base
+    - /utlidar/cloud_deskewed
+    - /frontvideostream
+  standard:   # default, ~1.4 MB/s
+    - /lowstate
+    - /lowcmd
+    - /utlidar/cloud_deskewed
+  full:       # adds the deskewed cloud, ~6 MB/s
+    - /lowstate
+    - /lowcmd
+
+# Excluded only with --no-audio
+audio:
+  - /audiosender
+
+# Approximate bandwidth per profile (MB/s), used for the free-disk check
+rate_mb_s:
+  lite: 0.4
+  standard: 1.4
+  full: 6.0
