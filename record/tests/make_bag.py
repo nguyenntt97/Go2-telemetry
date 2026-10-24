@@ -173,6 +173,43 @@ def uwb_state(index: int) -> dict:
     }
 
 
+def odometry(index: int) -> dict:
+    return {
+        "header": {"stamp": {"sec": 1700000000 + index, "nanosec": 0}, "frame_id": "odom"},
+        "child_frame_id": "base_link",
+        "pose": {
+            "pose": {
+                "position": {"x": 0.2 * index, "y": 0.1, "z": 0.32},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+            "covariance": [0.0] * 36,
+        },
+        "twist": {
+            "twist": {
+                "linear": {"x": 0.5, "y": 0.0, "z": 0.0},
+                "angular": {"x": 0.0, "y": 0.0, "z": 0.05},
+            },
+            "covariance": [0.0] * 36,
+        },
+    }
+
+
+def imu_message(index: int) -> dict:
+    return {
+        "header": {"stamp": {"sec": 1700000000 + index, "nanosec": 0}, "frame_id": "utlidar_imu"},
+        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        "orientation_covariance": [0.0] * 9,
+        "angular_velocity": {"x": 0.01, "y": 0.02, "z": 0.03},
+        "angular_velocity_covariance": [0.0] * 9,
+        "linear_acceleration": {"x": 0.0, "y": 0.0, "z": 9.81},
+        "linear_acceleration_covariance": [0.0] * 9,
+    }
+
+
+def wireless_controller(index: int) -> dict:
+    return {"lx": 0.1 * index, "ly": 0.0, "rx": -0.2, "ry": 0.0, "keys": 2}
+
+
 def point_cloud(points: int = 4) -> dict:
     import struct
 
