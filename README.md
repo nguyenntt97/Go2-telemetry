@@ -5,6 +5,7 @@ Tools that run on the Jetson payload (`192.168.123.18`, interface `enP8p1s0`) to
 | Path | What it is | Status |
 |---|---|---|
 | `uwb_rviz/` | Live RViz view of the UWB remote | Working |
+| `record/view.py` | Rerun server for a recorded session, for a remote viewer | Working |
 | `record/` | Recorder for robot telemetry, saved to `logs/` | Working |
 | `logs/` | Recording sessions | Created by the recorder |
 
@@ -62,6 +63,7 @@ python3 record/summarize.py logs/<session>                   # re-run the per-to
 python3 record/verify.py logs/<session>                      # re-run the reading checks
 python3 record/export.py logs/<session>                      # flatten to one table per topic
 python3 record/export.py logs/<session> --list               # what is in the session
+python3 record/view.py                                       # pick a session, view it in Rerun
 ```
 
 Each run checks the network, disk space and key topics, then records until the time is up or Ctrl+C. While recording it logs Jetson hardware once per second to `meta/hardware.csv`. At the end it prints:
@@ -134,9 +136,89 @@ The tests build synthetic rosbag2 sqlite3 bags with the same schema and CDR enco
 
 What the tests cannot cover is the one thing that needs the robot: whether the local `.msg` definitions agree with what it actually sends. Run a real session through `--list` and then `export.py`, and check `export_report.json` for decode failures.
 
+## Viewing a session in Rerun (`record/view.py`)
+
+Serves a recorded session to a Rerun viewer, which can be on another machine. Needs `pip install rerun-sdk` (tested against 0.40). Reading is done by `go2export`, so no ROS is needed and this runs wherever the logs are mounted.
+
+```bash
+python3 record/view.py                                  # pick a session, pick telemetry
+python3 record/view.py walk_test_20261023_143002        # by name, under the logs root
+python3 record/view.py <session> --telemetry pose,uwb,video
+python3 record/view.py <session> --serve web            # remote client just opens a browser
+python3 record/view.py <session> --list-telemetry       # what the session has, then stop
+```
+
+With no session argument it lists what is on the drive, newest first, with size, profile and note, and asks. With no `--telemetry` it lists the telemetry the session actually contains and asks. `--yes` takes the defaults (newest session, all telemetry) for running unattended.
+
+The logs root defaults to `/media/nguyen/project_data/go2/logs`; `--logs-root` or `$GO2_LOGS` override it.
+
+### Connecting from another machine
+
+The server holds the recording in memory and waits. It listens on every interface, but Rerun reports `127.0.0.1`, so the printed URL is rewritten with this machine's LAN address (`--advertise-host` to set it by hand, e.g. a hostname or a tunnel endpoint).
+
+| `--serve` | What happens |
+|---|---|
+| `grpc` (default) | Waits for a viewer. Connect with `rerun --connect rerun+http://<host>:9876/proxy`, or paste that into the viewer's "Add connection". |
+| `web` | Also hosts the viewer itself, so a remote client only needs a browser at `http://<host>:9090`. |
+| `spawn` | Opens a viewer on this machine and exits once the data is sent. |
+| `save` | Writes an `.rrd` file instead of serving, to hand around or open later. |
+
+`--memory-limit` (default 2 GiB) is how much the server keeps before dropping the oldest data; a long session with point clouds will need more, or `--cloud-stride`.
+
+### What gets shown
+
+| Group | Topics | In the viewer |
+|---|---|---|
+| `pose` | `/sportmodestate` | Robot transform and body box, a trail, velocity / yaw rate / gait plots |
+| `imu` | `/lf/lowstate`, `/utlidar/imu` | Gyro, accelerometer, roll-pitch-yaw |
+| `feet` | `/lf/lowstate`, `/sportmodestate` | Foot forces, and the four feet in the robot's frame |
+| `battery` | `/lf/lowstate`, `/lf/battery_alarm` | State of charge, current, per-cell voltages |
+| `uwb` | `/uwbstate` | The remote as a point and a ray from the robot, plus every angle field |
+| `odom` | `/utlidar/robot_odom`, `/utlidar/robot_pose`, SLAM odometry | Pose and twist per source |
+| `clouds` | `/utlidar/cloud*` | Point clouds, coloured by intensity |
+| `video` | `/frontvideostream` | The 720p and 360p H.264 streams, on the same timeline |
+| `events` | `/annotations`, `/api/*`, `/multiplestate` | A text log, so `mark.sh` labels appear against the data |
+| `jetson` | `meta/hardware.csv` | Jetson load, so a dropout can be put next to what the Jetson was doing |
+
+Groups are what a person picks from, not one per topic, so `/lf/lowstate` feeds imu, feet and battery. A topic several selected groups want is read and decoded once.
+
+Two timelines are set on everything: `receive` (the Jetson's wall clock) and `session` (seconds from the start). Because all topics share the receive clock, they line up without correction — including the video, so a frame can be read against the pose at that instant.
+
+The front camera is parsed from the bytes, not through `Go2FrontVideoData`, and logged as a `VideoStream` so Rerun decodes it; the two resolutions become separate streams and frames before the first keyframe are dropped.
+
+The UWB mapping takes the same parameters as `uwb_rviz/` (`--bearing-field`, `--bearing-sign`, `--bearing-offset`, `--elevation-field`), so whatever the calibration session settles on transfers between the two tools:
+
+```bash
+python3 record/view.py <session> --telemetry uwb \
+  --bearing-field yaw_est --bearing-sign -1.0 --elevation-field none
+```
+
+Since every angle field is plotted alongside the derived bearing, a recorded calibration session can be read off the plots directly rather than guessed at live.
+
+### Options worth knowing
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--start`, `--duration` | `0`, `0` | Only a window of the session, in seconds from its start |
+| `--cloud-stride` | `1` | Keep every Nth cloud frame |
+| `--max-cloud-points` | `0` (all) | Subsample clouds larger than this |
+| `--trail-length`, `--trail-every` | `600`, `25` | Length of the pose trail, and how often it is redrawn |
+| `--quaternion-order` | `wxyz` | Unitree sends `w,x,y,z`; Rerun wants `x,y,z,w` |
+| `--decoder`, `--msg-path` | `auto` | As for `export.py` |
+
+### Tests
+
+```bash
+python3 record/tests/test_view.py
+```
+
+The handlers are tested by standing in for the `rerun` module and recording what they log, so the assertions are about entity paths and geometry rather than Rerun's own behaviour. The UWB mapping and the quaternion reordering are pure functions and are tested directly. Also covered: session discovery and selection, the telemetry menu, per-topic dispatch (including that a shared topic is decoded once and that the video topic is never decoded through a message type), the time window, `hardware.csv` parsing, and that one failing handler does not stop the rest.
+
+Not covered by the tests, because it needs a viewer: the picture itself. Both serve modes were checked by hand — the gRPC port accepts connections on the non-loopback address, and `--serve web` returns the viewer page — but whether the robot looks right on screen has to be judged with a real session.
+
 ## Implementation plan
 
-Goal: record the Go2's telemetry into `logs/`, in a form that is easy to analyse later. Steps 1–5 below are built and tested.
+Goal: record the Go2's telemetry into `logs/`, in a form that is easy to analyse later. Steps 1–5 and 8 below are built and tested; step 7 is still optional work.
 
 Scope decisions:
 
@@ -215,6 +297,7 @@ logs/<name>_<YYYYmmdd_HHMMSS>/
 5. **`record/export.py <session>`**: flattens a session into one Parquet or CSV file per topic, timestamped by when the Jetson received each message. See [Exporting a session](#exporting-a-session-recordexportpy) below.
 6. **Time alignment**: all topics share the Jetson's receive clock, so they line up without extra work.
 7. **Optional, later**: get the missing `.msg` files from a newer `unitree_ros2` release, rebuild `cyclonedds_ws`, and drop `/utlidar/voxel_map_compressed` and `/config_change_status` from the base exclude list. The `unitree_interfaces` and `unitree_arm` types are probably not public and are not needed for analysis.
+8. **`record/view.py <session>`**: serves a session to a Rerun viewer, which can be on another machine, with the session and the telemetry chosen interactively. See [Viewing a session in Rerun](#viewing-a-session-in-rerun-recordviewpy).
 
 ### Not covered
 
