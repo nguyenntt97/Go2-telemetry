@@ -5,7 +5,7 @@ Tools that run on the Jetson payload (`192.168.123.18`, interface `enP8p1s0`) to
 | Path | What it is | Status |
 |---|---|---|
 | `uwb_rviz/` | Live RViz view of the UWB remote | Working |
-| `record/` | Recorder for robot telemetry, saved to `logs/` | Recording works; `export.py` not built yet |
+| `record/` | Recorder for robot telemetry, saved to `logs/` | Working |
 | `logs/` | Recording sessions | Created by the recorder |
 
 ---
@@ -60,6 +60,8 @@ bash record/go2_record.sh mapping --profile full --no-audio
 bash record/mark.sh "start circle"                           # label an event in the running session
 python3 record/summarize.py logs/<session>                   # re-run the per-topic summary
 python3 record/verify.py logs/<session>                      # re-run the reading checks
+python3 record/export.py logs/<session>                      # flatten to one table per topic
+python3 record/export.py logs/<session> --list               # what is in the session
 ```
 
 Each run checks the network, disk space and key topics, then records until the time is up or Ctrl+C. While recording it logs Jetson hardware once per second to `meta/hardware.csv`. At the end it prints:
@@ -69,9 +71,72 @@ Each run checks the network, disk space and key topics, then records until the t
 
 `hardware.csv` columns: CPU load (total and per core), CPU frequency, load average, RAM and swap, GPU load, temperatures (cpu, gpu, soc0–2, tj), power rails (VDD_IN, VDD_CPU_GPU_CV, VDD_SOC), fan, disk free and read/write rate, network rx/tx for `enP8p1s0` and Wi-Fi, and CPU and memory of the recorder process.
 
+## Exporting a session (`record/export.py`)
+
+Turns a recorded session into tables that pandas, DuckDB or a spreadsheet can open, one file per topic, plus the two payloads that do not belong in a table.
+
+```bash
+python3 record/export.py logs/<session>                     # Parquet if pyarrow is installed, else CSV
+python3 record/export.py logs/<session> --list              # topics and message counts, export nothing
+python3 record/export.py logs/<session> --format csv --clouds --video mp4
+python3 record/export.py logs/<session> --topics '^/(sportmodestate|uwbstate)$'
+```
+
+Output goes to `logs/<session>/export/` (`--out` to change it):
+
+```
+export/
+  sportmodestate.parquet        one file per topic, `/` becomes `__`
+  lf__lowstate.parquet
+  uwbstate.parquet
+  utlidar__cloud_base.parquet   cloud metadata; the points go to clouds/
+  annotations.parquet
+  video/  frontvideostream_720p.h264        recorded bytes, untouched
+          frontvideostream_720p_index.*     frame index: time, offset, length, keyframe
+          frontvideostream_360p.h264
+  clouds/<topic>/<nnnnnn>_<t_ns>.npz        only with --clouds
+  export_report.json            per topic: rows, columns, decoder used, decode failures
+```
+
+Every table starts with `t_ns` (the Jetson receive timestamp), `t_rel` (seconds from the start of the session) and `t_iso`. Because all topics share the receive clock, joining two tables on `t_ns` needs no correction.
+
+Message fields are flattened by rule rather than by a list of wanted fields per topic, so a topic that gains a field still exports it: nested messages become `imu_state.gyroscope.0`, arrays up to `--max-array` (32) become indexed columns, longer ones and byte blobs become a `.len` column. Motor arrays are dropped by default (`--no-default-skip` keeps them), since 20 motors × 7 fields are most of `/lf/lowstate`'s columns and are not what the 20 Hz topic is kept for.
+
+### How it decodes without depending on ROS
+
+The bag is read straight out of its sqlite3 files with the standard library, and blobs are decoded one of two ways (`--decoder`):
+
+- **`ros`** — the installed typesupport, authoritative when the types are built.
+- **`msgdef`** — the `.msg` files are parsed and the CDR laid out from them. Needs no ROS, so a session can be exported off the Jetson.
+- **`auto`** (default) — `ros` when it is importable, otherwise `msgdef`.
+
+`msgdef` reads the definitions from `~/unitree_ros2` and `/opt/ros/humble/share` (`--msg-path` to add more), never from field orders written into the exporter: a wrong field order would give plausible but wrong numbers. Because the recorder subscribes to everything, a type that fails to decode is counted in `export_report.json` and the rest of the session still exports.
+
+### Video
+
+The local `Go2FrontVideoData` definition does not match what the robot sends (decoding fails with "invalid data size"), but the raw bytes are recorded intact, so this topic is parsed from the bytes instead of through its message type. Layout of each message: 4-byte CDR header, `uint64` time_frame, `uint32` resolution (720 or 360), `uint32` length, then that many bytes of H.264 Annex-B.
+
+The two resolutions are interleaved on the one topic and are split into a stream each, at about 14 Hz with a keyframe roughly every 2 s. Frames before a stream's first keyframe cannot be decoded, so they are dropped and counted (`dropped_before_keyframe` in the report) — the 5 lost frames per stream in the 2026-10-23 test were these.
+
+`--video raw` (default) writes the recorded bytes as `.h264`, which is lossless and what any decoder should be pointed at. `--video mp4` additionally decodes and re-encodes with OpenCV, which is lossy; ffmpeg is not installed on the Jetson, but OpenCV carries its own.
+
+### Dependencies
+
+The default run needs only the standard library. pyarrow enables Parquet (CSV is written instead when it is missing), numpy enables `--clouds`, and OpenCV enables `--video mp4`; each is reported as unavailable rather than failing the export.
+
+### Tests
+
+```bash
+python3 record/tests/test_export.py
+```
+
+The tests build synthetic rosbag2 sqlite3 bags with the same schema and CDR encoding as a real session, so they need no robot, no ROS and no recording. They cover CDR alignment and both endiannesses, `.msg` parsing, round-tripping each recorded message type, the flattening rules, split sessions, the video layout and keyframe handling, and point cloud conversion. The `.msg` files under `record/tests/msgs/` are fixtures that mirror the real definitions; they are not authoritative, and the exporter does not use them at run time.
+
+What the tests cannot cover is the one thing that needs the robot: whether the local `.msg` definitions agree with what it actually sends. Run a real session through `--list` and then `export.py`, and check `export_report.json` for decode failures.
+
 ## Implementation plan
 
-Goal: record the Go2's telemetry into `logs/`, in a form that is easy to analyse later. Steps 1–4 below are built and tested; step 5 (`export.py`) is not built yet.
+Goal: record the Go2's telemetry into `logs/`, in a form that is easy to analyse later. Steps 1–5 below are built and tested.
 
 Scope decisions:
 
@@ -147,12 +212,7 @@ logs/<name>_<YYYYmmdd_HHMMSS>/
    - On exit (time up or Ctrl+C), stops everything cleanly and runs the summary and the reading checks.
 3. **`record/mark.sh "text"`**: publishes a `std_msgs/String` on `/annotations` so events can be labelled during a session (for example "start circle", "turn 90 left").
 4. **`record/summarize.py <session>`**: writes per-topic count, rate, largest gap and size to `meta/summary.csv`, and flags dropouts by comparing against the measured rates above. **`record/verify.py <session>`** decodes the key topics and checks the values are plausible (`meta/verify.txt`).
-5. **`record/export.py <session>`**: flattens a session into one Parquet or CSV file per topic, timestamped by when the Jetson received each message:
-   - `sportmodestate`: position, velocity, yaw rate, gait
-   - `lf/lowstate`: IMU, foot force, battery (motor fields skipped)
-   - `uwbstate`, lidar and SLAM odometry, controller input, annotations, battery cells, `/api/*` calls
-   - Point clouds (`cloud_base`, SLAM maps) optionally to `.npz` per frame
-   - **Video needs a custom parser.** The local `Go2FrontVideoData` definition does not match what the robot sends (decoding fails with "invalid data size"), but the raw bytes are recorded intact. Layout of each message: 4-byte CDR header, `uint64` time_frame, `uint32` resolution (720 or 360), `uint32` length, then that many bytes of H.264 Annex-B. Each stream (720p and 360p) arrives at about 14 Hz with a keyframe roughly every 2 s. A first test on 2026-10-23 decoded 702 of 707 frames per stream with OpenCV, at 1280×720 and 640×360; the 5 lost frames were before the first keyframe. ffmpeg is not installed; OpenCV's built-in FFmpeg can write the `.mp4`.
+5. **`record/export.py <session>`**: flattens a session into one Parquet or CSV file per topic, timestamped by when the Jetson received each message. See [Exporting a session](#exporting-a-session-recordexportpy) below.
 6. **Time alignment**: all topics share the Jetson's receive clock, so they line up without extra work.
 7. **Optional, later**: get the missing `.msg` files from a newer `unitree_ros2` release, rebuild `cyclonedds_ws`, and drop `/utlidar/voxel_map_compressed` and `/config_change_status` from the base exclude list. The `unitree_interfaces` and `unitree_arm` types are probably not public and are not needed for analysis.
 
