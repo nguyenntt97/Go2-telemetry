@@ -208,9 +208,16 @@ def load_uwb(s, dec):
     pos = np.column_stack([d * np.cos(elev) * np.cos(bearing),
                            d * np.cos(elev) * np.sin(bearing),
                            d * np.sin(elev)]).astype(np.float32)
-    rr.send_columns("world/uwb_tag", [_tc(t)],
-                    rr.Points3D.columns(positions=pos, radii=np.full(len(t), 0.08, np.float32)))
-    rr.log("world/uwb_tag", rr.Points3D.from_fields(colors=[[80, 230, 140]]), static=True)
+    # Log tag and connecting beam under world/robot so it moves with the robot odometry/pose
+    rr.send_columns("world/robot/uwb_tag", [_tc(t)],
+                    rr.Points3D.columns(positions=pos, radii=np.full(len(t), 0.08, np.float32),
+                                        colors=np.full((len(t), 3), [80, 230, 140], dtype=np.uint8)))
+    origin = np.zeros_like(pos)
+    strips = np.stack([origin, pos], axis=1)
+    rr.send_columns("world/robot/uwb_beam", [_tc(t)],
+                    rr.LineStrips3D.columns(strips=strips,
+                                            colors=np.full((len(t), 4), [80, 230, 140, 160], dtype=np.uint8),
+                                            radii=np.full(len(t), 0.008, np.float32)))
     say(f"   uwb: {len(t)} samples, range {d.min():.2f}..{d.max():.2f} m")
     return True
 
@@ -221,6 +228,7 @@ def load_odom(s, dec):
     if m is None:
         return False
     pos = m["position"].astype(np.float32)
+    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     rr.log("world/odom_path", rr.LineStrips3D([pos], colors=[[255, 120, 190]], radii=[0.008]),
            static=True)
     vector("odom/linear", t, m["linear"], ["x", "y", "z"])
@@ -332,26 +340,39 @@ GROUPS = {
     "events":    ("Annotations, alarms, status text", [], load_events),
 }
 
-DEFAULT = ["pose", "body", "imu", "battery", "uwb", "events"]
+DEFAULT = ["pose", "body", "imu", "battery", "uwb", "events", "video"]
 
 
 # --- blueprint ----------------------------------------------------------------
 
 def blueprint(chosen):
-    """A starting layout: 3D on the left, the chosen time series as tabs."""
+    """A starting layout: 3D on the left, camera and telemetry on the right."""
     spatial = [g for g in ("pose", "odom", "cloud", "uwb") if g in chosen]
+    left = rrb.Spatial3DView(origin="world", name="world") if spatial else None
+
+    # Separate camera into its own dedicated 2D view rather than burying in tabs
+    cam = rrb.Spatial2DView(origin="camera", name="camera") if "video" in chosen else None
+
+    # Time-series tabs: place uwb first if selected so it is immediately active
     tabs = []
+    if "uwb" in chosen:
+        tabs.append(rrb.TimeSeriesView(origin="/uwb", name="uwb"))
     for g in chosen:
+        if g in ("pose", "odom", "cloud", "video", "uwb"):
+            continue
         if g == "events":
             tabs.append(rrb.TextLogView(origin="events", name="events"))
-        elif g == "video":
-            tabs.append(rrb.Spatial2DView(origin="camera", name="camera"))
-        elif g in ("pose", "odom", "cloud"):
-            continue
         else:
             tabs.append(rrb.TimeSeriesView(origin=f"/{g}", name=g))
-    right = rrb.Tabs(*tabs) if tabs else None
-    left = rrb.Spatial3DView(origin="world", name="world") if spatial else None
+
+    right_ts = rrb.Tabs(*tabs) if len(tabs) > 1 else (tabs[0] if tabs else None)
+
+    # If both camera and time-series are present, split right panel vertically
+    if cam and right_ts:
+        right = rrb.Vertical(cam, right_ts, row_shares=[1, 1])
+    else:
+        right = cam or right_ts
+
     if left and right:
         return rrb.Blueprint(rrb.Horizontal(left, right, column_shares=[1, 1]),
                              collapse_panels=False)
